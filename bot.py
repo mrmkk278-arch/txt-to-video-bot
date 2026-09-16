@@ -2,37 +2,55 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
 from pathlib import Path
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 from PIL import Image, ImageDraw, ImageFont
 from telegram import Update
-from telegram.ext import Application, MessageHandler, ContextTypes, filters
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
-VIDEO_WIDTH = 1080
-VIDEO_HEIGHT = 1920
+VIDEO_WIDTH = 1920
+VIDEO_HEIGHT = 1080
 FPS = 30
 SECONDS_PER_PAGE = 4
 
-FONT_PATH = "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf"
+FONT_PATH = "/usr/share/fonts/opentype/noto/NotoSansDevanagari-Regular.ttf"
+
+
+# Render Web Service ke liye simple health server
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is running")
+
+    def log_message(self, format, *args):
+        pass
+
+
+def start_health_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    server.serve_forever()
 
 
 def make_pages(text, output_dir):
-    font = ImageFont.truetype(FONT_PATH, 48)
-    title_font = ImageFont.truetype(FONT_PATH, 58)
+    font = ImageFont.truetype(FONT_PATH, 42)
+    title_font = ImageFont.truetype(FONT_PATH, 52)
 
     lines = text.splitlines()
 
     pages = []
     current = []
 
-    # TXT को छोटे-छोटे pages में बाँटना
     for line in lines:
         current.append(line)
 
-        if len(current) >= 18:
+        if len(current) >= 14:
             pages.append("\n".join(current))
             current = []
 
@@ -48,27 +66,23 @@ def make_pages(text, output_dir):
 
         draw = ImageDraw.Draw(image)
 
-        # Header
         draw.text(
-            (60, 60),
+            (70, 50),
             "TXT TO VIDEO",
             font=title_font,
             fill="black"
         )
 
-        # Main text
         draw.multiline_text(
-            (70, 180),
+            (80, 150),
             page_text,
             font=font,
             fill="black",
-            spacing=22,
-            width=900
+            spacing=18
         )
 
-        # Page number
         draw.text(
-            (VIDEO_WIDTH - 180, VIDEO_HEIGHT - 100),
+            (1800, 1000),
             f"{page_number}",
             font=font,
             fill="gray"
@@ -137,11 +151,9 @@ async def txt_to_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         video_file = temp_dir / "output.mp4"
 
-        # Telegram से TXT download
         telegram_file = await context.bot.get_file(document.file_id)
         await telegram_file.download_to_drive(txt_file)
 
-        # TXT पढ़ना
         text = txt_file.read_text(
             encoding="utf-8",
             errors="replace"
@@ -151,13 +163,11 @@ async def txt_to_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await status.edit_text("❌ TXT file खाली है।")
             return
 
-        # Pages बनाना
         page_count = make_pages(
             text,
             image_dir
         )
 
-        # Video बनाना
         await status.edit_text(
             f"⏳ {page_count} pages तैयार हो गए हैं...\n"
             "अब video बना रहा हूँ।"
@@ -168,7 +178,6 @@ async def txt_to_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
             video_file
         )
 
-        # Telegram पर सीधे भेजना
         await status.edit_text(
             "📤 Video तैयार है...\nTelegram पर upload कर रहा हूँ।"
         )
@@ -189,11 +198,10 @@ async def txt_to_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "❌ Video बनाने में error आया।\n"
                 "Logs देखकर इसे ठीक करेंगे।"
             )
-        except:
+        except Exception:
             pass
 
     finally:
-        # Server की temporary files delete
         shutil.rmtree(
             temp_dir,
             ignore_errors=True
@@ -206,6 +214,12 @@ def main():
             "BOT_TOKEN environment variable नहीं मिला।"
         )
 
+    # Health server अलग thread में
+    threading.Thread(
+        target=start_health_server,
+        daemon=True
+    ).start()
+
     app = (
         Application.builder()
         .token(BOT_TOKEN)
@@ -213,16 +227,13 @@ def main():
     )
 
     app.add_handler(
-        MessageHandler(
-            filters.Document.ALL,
-            txt_to_video
-        )
+        CommandHandler("start", start)
     )
 
     app.add_handler(
         MessageHandler(
-            filters.COMMAND & filters.Regex("^/start$"),
-            start
+            filters.Document.ALL,
+            txt_to_video
         )
     )
 
