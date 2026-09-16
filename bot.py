@@ -8,20 +8,32 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 
 from PIL import Image, ImageDraw, ImageFont
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
 
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
-VIDEO_WIDTH = 1920
-VIDEO_HEIGHT = 1080
-FPS = 30
+VIDEO_WIDTH = 1280
+VIDEO_HEIGHT = 720
+
+FPS = 2
 SECONDS_PER_PAGE = 4
+
+PAGES_PER_CHUNK = 50
 
 FONT_PATH = "/usr/share/fonts/opentype/noto/NotoSansDevanagari-Regular.ttf"
 
 
-# Render Web Service ke liye simple health server
+# -----------------------------
+# Render health server
+# -----------------------------
+
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -34,30 +46,37 @@ class HealthHandler(BaseHTTPRequestHandler):
 
 def start_health_server():
     port = int(os.environ.get("PORT", 10000))
-    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+
+    server = HTTPServer(
+        ("0.0.0.0", port),
+        HealthHandler
+    )
+
     server.serve_forever()
 
 
-def make_pages(text, output_dir):
-    font = ImageFont.truetype(FONT_PATH, 42)
-    title_font = ImageFont.truetype(FONT_PATH, 52)
+# -----------------------------
+# Create page images
+# -----------------------------
 
-    lines = text.splitlines()
+def make_pages(page_texts, output_dir, start_number):
+    font = ImageFont.truetype(
+        FONT_PATH,
+        32
+    )
 
-    pages = []
-    current = []
+    title_font = ImageFont.truetype(
+        FONT_PATH,
+        42
+    )
 
-    for line in lines:
-        current.append(line)
+    created_files = []
 
-        if len(current) >= 14:
-            pages.append("\n".join(current))
-            current = []
+    for index, page_text in enumerate(
+        page_texts,
+        start=start_number
+    ):
 
-    if current:
-        pages.append("\n".join(current))
-
-    for page_number, page_text in enumerate(pages, start=1):
         image = Image.new(
             "RGB",
             (VIDEO_WIDTH, VIDEO_HEIGHT),
@@ -67,50 +86,79 @@ def make_pages(text, output_dir):
         draw = ImageDraw.Draw(image)
 
         draw.text(
-            (70, 50),
+            (50, 35),
             "TXT TO VIDEO",
             font=title_font,
             fill="black"
         )
 
         draw.multiline_text(
-            (80, 150),
+            (60, 110),
             page_text,
             font=font,
             fill="black",
-            spacing=18
+            spacing=12
         )
 
         draw.text(
-            (1800, 1000),
-            f"{page_number}",
+            (1190, 660),
+            str(index),
             font=font,
             fill="gray"
         )
 
-        filename = output_dir / f"page_{page_number:04d}.png"
-        image.save(filename)
+        filename = output_dir / f"page_{index:04d}.png"
 
-    return len(pages)
+        image.save(
+            filename,
+            optimize=True
+        )
+
+        created_files.append(filename)
+
+        del draw
+        del image
+
+    return created_files
 
 
-def make_video(image_dir, output_file):
+# -----------------------------
+# Create video chunk
+# -----------------------------
+
+def make_chunk_video(image_dir, output_file):
     command = [
         "ffmpeg",
         "-y",
+
         "-framerate",
         f"1/{SECONDS_PER_PAGE}",
+
         "-i",
         str(image_dir / "page_%04d.png"),
+
         "-c:v",
         "libx264",
+
+        "-preset",
+        "ultrafast",
+
+        "-crf",
+        "28",
+
+        "-threads",
+        "1",
+
         "-pix_fmt",
         "yuv420p",
+
         "-r",
         str(FPS),
-        "-vf",
-        f"scale={VIDEO_WIDTH}:{VIDEO_HEIGHT}",
-        str(output_file)
+
+        "-movflags",
+        "+faststart",
+
+        str(output_file),
     ]
 
     subprocess.run(
@@ -121,38 +169,126 @@ def make_video(image_dir, output_file):
     )
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# -----------------------------
+# Join video chunks
+# -----------------------------
+
+def join_chunks(chunk_files, final_file):
+    concat_file = final_file.parent / "concat.txt"
+
+    with open(
+        concat_file,
+        "w",
+        encoding="utf-8"
+    ) as f:
+
+        for chunk in chunk_files:
+            f.write(
+                f"file '{chunk.as_posix()}'\n"
+            )
+
+    command = [
+        "ffmpeg",
+        "-y",
+
+        "-f",
+        "concat",
+
+        "-safe",
+        "0",
+
+        "-i",
+        str(concat_file),
+
+        "-c",
+        "copy",
+
+        "-movflags",
+        "+faststart",
+
+        str(final_file),
+    ]
+
+    subprocess.run(
+        command,
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
+    )
+
+    concat_file.unlink(
+        missing_ok=True
+    )
+
+
+# -----------------------------
+# Start command
+# -----------------------------
+
+async def start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
     await update.message.reply_text(
         "नमस्ते! 👋\n\n"
         "मुझे कोई भी .txt file भेजो।\n"
-        "मैं उसे video में convert करके इसी Telegram chat में भेज दूँगा।"
+        "मैं उसे horizontal video में convert करके "
+        "इसी Telegram chat में भेज दूँगा।"
     )
 
 
-async def txt_to_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# -----------------------------
+# TXT -> VIDEO
+# -----------------------------
+
+async def txt_to_video(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
     document = update.message.document
 
     if not document.file_name.lower().endswith(".txt"):
+
         await update.message.reply_text(
             "❌ केवल .txt file भेजो।"
         )
+
         return
 
     status = await update.message.reply_text(
-        "⏳ TXT मिल गई है...\nVideo तैयार कर रहा हूँ।"
+        "⏳ TXT मिल गई है...\n"
+        "Video तैयार कर रहा हूँ।"
     )
 
-    temp_dir = Path(tempfile.mkdtemp(prefix="txt_video_"))
+    temp_dir = Path(
+        tempfile.mkdtemp(
+            prefix="txt_video_"
+        )
+    )
 
     try:
+
         txt_file = temp_dir / "input.txt"
-        image_dir = temp_dir / "pages"
-        image_dir.mkdir()
 
-        video_file = temp_dir / "output.mp4"
+        chunks_dir = temp_dir / "chunks"
 
-        telegram_file = await context.bot.get_file(document.file_id)
-        await telegram_file.download_to_drive(txt_file)
+        chunks_dir.mkdir()
+
+        final_video = temp_dir / "output.mp4"
+
+        # Download TXT
+
+        telegram_file = await context.bot.get_file(
+            document.file_id
+        )
+
+        await telegram_file.download_to_drive(
+            txt_file
+        )
+
+        # Read TXT
 
         text = txt_file.read_text(
             encoding="utf-8",
@@ -160,29 +296,137 @@ async def txt_to_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         if not text.strip():
-            await status.edit_text("❌ TXT file खाली है।")
+
+            await status.edit_text(
+                "❌ TXT file खाली है।"
+            )
+
             return
 
-        page_count = make_pages(
-            text,
-            image_dir
-        )
+        # -----------------------------
+        # Prepare pages
+        # -----------------------------
+
+        lines = text.splitlines()
+
+        pages = []
+
+        current = []
+
+        for line in lines:
+
+            current.append(line)
+
+            if len(current) >= 14:
+
+                pages.append(
+                    "\n".join(current)
+                )
+
+                current = []
+
+        if current:
+
+            pages.append(
+                "\n".join(current)
+            )
+
+        total_pages = len(pages)
 
         await status.edit_text(
-            f"⏳ {page_count} pages तैयार हो गए हैं...\n"
-            "अब video बना रहा हूँ।"
+            f"📄 कुल {total_pages} pages मिले हैं.\n"
+            f"अब chunks में video बनाया जा रहा है..."
         )
 
-        make_video(
-            image_dir,
-            video_file
-        )
+        # -----------------------------
+        # Make chunks
+        # -----------------------------
+
+        chunk_files = []
+
+        chunk_number = 1
+
+        for start_index in range(
+            0,
+            total_pages,
+            PAGES_PER_CHUNK
+        ):
+
+            chunk_pages = pages[
+                start_index:
+                start_index + PAGES_PER_CHUNK
+            ]
+
+            image_dir = (
+                temp_dir /
+                f"images_{chunk_number}"
+            )
+
+            image_dir.mkdir()
+
+            make_pages(
+                chunk_pages,
+                image_dir,
+                start_index + 1
+            )
+
+            chunk_file = (
+                chunks_dir /
+                f"chunk_{chunk_number:04d}.mp4"
+            )
+
+            await status.edit_text(
+                f"🎬 Video बन रहा है...\n"
+                f"Pages: "
+                f"{start_index + 1}-"
+                f"{min(start_index + PAGES_PER_CHUNK, total_pages)}\n"
+                f"Chunk: {chunk_number}"
+            )
+
+            make_chunk_video(
+                image_dir,
+                chunk_file
+            )
+
+            chunk_files.append(
+                chunk_file
+            )
+
+            # Images immediately delete
+            shutil.rmtree(
+                image_dir,
+                ignore_errors=True
+            )
+
+            chunk_number += 1
+
+        # -----------------------------
+        # Join all chunks
+        # -----------------------------
 
         await status.edit_text(
-            "📤 Video तैयार है...\nTelegram पर upload कर रहा हूँ।"
+            "🔗 सभी video parts को जोड़ रहा हूँ..."
         )
 
-        with open(video_file, "rb") as video:
+        join_chunks(
+            chunk_files,
+            final_video
+        )
+
+        # -----------------------------
+        # Upload to Telegram
+        # -----------------------------
+
+        await status.edit_text(
+            "📤 Video तैयार है...\n"
+            "Telegram पर upload कर रहा हूँ..."
+        )
+
+        with open(
+            final_video,
+            "rb"
+        ) as video:
+
             await update.message.reply_video(
                 video=video,
                 caption="✅ TXT से तैयार की गई Video"
@@ -191,30 +435,43 @@ async def txt_to_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status.delete()
 
     except Exception as e:
-        print("ERROR:", e)
+
+        print(
+            "ERROR:",
+            repr(e)
+        )
 
         try:
+
             await status.edit_text(
                 "❌ Video बनाने में error आया।\n"
-                "Logs देखकर इसे ठीक करेंगे।"
+                "Render logs में error check करना होगा।"
             )
+
         except Exception:
             pass
 
     finally:
+
+        # Everything temporary gets deleted
         shutil.rmtree(
             temp_dir,
             ignore_errors=True
         )
 
 
+# -----------------------------
+# Main
+# -----------------------------
+
 def main():
+
     if not BOT_TOKEN:
+
         raise RuntimeError(
             "BOT_TOKEN environment variable नहीं मिला।"
         )
 
-    # Health server अलग thread में
     threading.Thread(
         target=start_health_server,
         daemon=True
@@ -227,7 +484,10 @@ def main():
     )
 
     app.add_handler(
-        CommandHandler("start", start)
+        CommandHandler(
+            "start",
+            start
+        )
     )
 
     app.add_handler(
@@ -237,7 +497,9 @@ def main():
         )
     )
 
-    print("Bot started...")
+    print(
+        "Bot started..."
+    )
 
     app.run_polling()
 
